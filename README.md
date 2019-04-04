@@ -1,3 +1,5 @@
+# PhysFS fork with magic streams
+
 This is an unofficial, non-supported, unmaintained fork of PhysFS with
 "magic streams", for those who might want that functionality.
 
@@ -28,20 +30,22 @@ Usage:
 1. Make your application use physfs.
 2. Identify deterministic file i/o operations you want to speed up. Deterministic in this case means something that is always done the same way, in the same order.
 3. At the beginning of the file i/o operation block, open a file for writing and call the create magicstream call:
-
-    PHYSFS_File *sf = PHYSFS_openWrite("test.magicstream");
-	PHYSFS_createMagicStream(sf);
-	
+```C
+    PHYSFS_File *sf;
+    sf = PHYSFS_openWrite("test.magicstream");
+    PHYSFS_createMagicStream(sf);
+```	
 4. At the end of the file i/o operation block, call the close magicstream call:
-
+```C
     PHYSFS_closeMagicStream();
-    
+```    
 5. Run your application, generating the magic stream file.
 6. Modify the application to open magic stream instead of creating it:
-
-    PHYSFS_File *sf = PHYSFS_openRead("test.magicstream");
+```C
+    PHYSFS_File *sf;
+    sf = PHYSFS_openRead("test.magicstream");
     PHYSFS_openMagicStream(sf);
-
+```
 7. The close call is the same as with the creation.
 
 If you find this useful, plase do let me know. 
