@@ -50,3 +50,5 @@ Usage:
 
 If you find this useful, plase do let me know. 
 I am not, however, able to offer any support for this patch.
+
+-- Jari Komppa, http://iki.fi/sol/
