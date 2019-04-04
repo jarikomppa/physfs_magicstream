@@ -204,6 +204,24 @@
  *  bothering you, but it's good to be aware of these nuances in case they
  *  don't.
  *
+ * Magic streams can be used to accelerate file operations for deterministic
+ *  processes, such as initial game loads or level loads, at (potential) cost
+ *  of using more disk space. Magic stream files are created by running
+ *  modified application code, writing all disk io operations into a linear
+ *  file. When using a created magic stream file, all file open and close
+ *  operations, seeks etc. are skipped and all data comes from the linear
+ *  data file. The data file is also read through physfs, so it can be
+ *  compressed for additional reduced disk i/o.
+ *
+ * Any files opened before opening the magic stream work normally, so it
+ *  is possible to, for example, stream music from a separate file while
+ *  loading from the magic stream.
+ *
+ * The magic streams do not affect file enumeration or file writes.
+ *
+ * Benefits of magic streams depend on the exact use case; using a physical
+ *  spinning media benefits more than in-memory file library due to seek
+ *  performance difference.
  *
  * Other stuff:
  *
@@ -3882,6 +3900,48 @@ PHYSFS_DECL int PHYSFS_setRoot(const char *archive, const char *subdir);
 
 
 /* Everything above this line is part of the PhysicsFS 3.1 API. */
+
+
+/**
+* \fn int PHYSFS_createMagicStream(PHYSFS_File *file)
+* \brief Open magic stream file for writing.
+*
+* This is used to start recording the magic stream. After this call,
+*  all read operations through physfs cause data to be written to
+*  the stream. Use PHYSFS_closeMagicStream to end recording.
+*
+* \param handle a physfs file handle that was opened for writing
+* \return nonzero on success, zero on failure. Use
+*         PHYSFS_getLastErrorCode() to obtain the specific error.
+*/
+PHYSFS_DECL int PHYSFS_createMagicStream(PHYSFS_File *handle);
+
+/**
+* \fn int PHYSFS_openMagicStream(PHYSFS_File *file)
+* \brief Open magic stream file for reading.
+*
+* This is used to start replaying the magic stream. After this call,
+*  all read operations through physfs cause data to be read from
+*  the stream. Use PHYSFS_closeMagicStream to end replaying.
+*
+* \param handle a physfs file handle that was opened for reading
+* \return nonzero on success, zero on failure. Use
+*         PHYSFS_getLastErrorCode() to obtain the specific error.
+*/
+PHYSFS_DECL int PHYSFS_openMagicStream(PHYSFS_File *handle);
+
+/**
+* \fn int PHYSFS_closeMagicStream()
+* \brief Close magic stream file.
+*
+* This is used to close the magic stream (either writing or reading).
+*
+* After this the physfs functionality returns to normal.
+*
+* \return nonzero on success, zero on failure. Use
+*         PHYSFS_getLastErrorCode() to obtain the specific error.
+*/
+PHYSFS_DECL int PHYSFS_closeMagicStream();
 
 
 #ifdef __cplusplus

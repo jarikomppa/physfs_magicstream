@@ -89,6 +89,7 @@ static PHYSFS_Archiver **archivers = NULL;
 static PHYSFS_ArchiveInfo **archiveInfo = NULL;
 static volatile size_t numArchivers = 0;
 static size_t longest_root = 0;
+static FileHandle *magicStream = NULL;
 
 /* mutexes ... */
 static void *errorLock = NULL;     /* protects error message list.        */
@@ -2698,6 +2699,27 @@ PHYSFS_File *PHYSFS_openRead(const char *_fname)
 
     BAIL_IF(!_fname, PHYSFS_ERR_INVALID_ARGUMENT, 0);
 
+    if (magicStream && magicStream->forReading)
+    {
+        /* magic stream replay: file opens are NOPs, so
+           we'll create a dummy file handle. */
+        fh = (FileHandle *)allocator.Malloc(sizeof(FileHandle));
+        if (fh == NULL)
+        {
+            PHYSFS_setErrorCode(PHYSFS_ERR_OUT_OF_MEMORY);
+            return NULL;
+        } /* if */
+
+        memset(fh, '\0', sizeof(FileHandle));
+        fh->io = 0;
+        fh->forReading = 1;
+        fh->dirHandle = 0;
+        fh->next = openReadList;
+        openReadList = fh;
+
+        return ((PHYSFS_File *)fh);
+    } /* if */
+
     __PHYSFS_platformGrabMutex(stateLock);
 
     BAIL_IF_MUTEX(!searchPath, PHYSFS_ERR_NOT_FOUND, stateLock, 0);
@@ -2759,16 +2781,19 @@ static int closeHandleInOpenList(FileHandle **list, FileHandle *handle)
             PHYSFS_Io *io = handle->io;
             PHYSFS_uint8 *tmp = handle->buffer;
 
-            /* send our buffer to io... */
-            if (!PHYSFS_flush((PHYSFS_File *) handle))
-                return -1;
+            if (io) /* magic streams create file handles with no io */
+            {
+                /* send our buffer to io... */
+                if (!PHYSFS_flush((PHYSFS_File *)handle))
+                    return -1;
 
-            /* ...then have io send it to the disk... */
-            else if (io->flush && !io->flush(io))
-                return -1;
+                /* ...then have io send it to the disk... */
+                else if (io->flush && !io->flush(io))
+                    return -1;
 
-            /* ...then close the underlying file. */
-            io->destroy(io);
+                /* ...then close the underlying file. */
+                io->destroy(io);
+            }
 
             if (tmp != NULL)  /* free any associated buffer. */
                 allocator.Free(tmp);
@@ -2862,8 +2887,15 @@ PHYSFS_sint64 PHYSFS_read(PHYSFS_File *handle, void *buffer,
 PHYSFS_sint64 PHYSFS_readBytes(PHYSFS_File *handle, void *buffer,
                                PHYSFS_uint64 _len)
 {
+    PHYSFS_sint64 retval;
     const size_t len = (size_t) _len;
     FileHandle *fh = (FileHandle *) handle;
+
+    if (fh->io == NULL)
+    {
+        BAIL_IF(magicStream == NULL, PHYSFS_ERR_IO, -1);
+        fh = magicStream;
+    }
 
 #ifdef PHYSFS_NO_64BIT_SUPPORT
     const PHYSFS_uint64 maxlen = __PHYSFS_UI64(0x7FFFFFFF);
@@ -2877,10 +2909,17 @@ PHYSFS_sint64 PHYSFS_readBytes(PHYSFS_File *handle, void *buffer,
     BAIL_IF(_len > maxlen, PHYSFS_ERR_INVALID_ARGUMENT, -1);
     BAIL_IF(!fh->forReading, PHYSFS_ERR_OPEN_FOR_WRITING, -1);
     BAIL_IF_ERRPASS(len == 0, 0);
+
     if (fh->buffer)
         return doBufferedRead(fh, buffer, len);
 
-    return fh->io->read(fh->io, buffer, len);
+    retval = fh->io->read(fh->io, buffer, len);
+
+    /* complete failure at read will mess up the magic stream.. */
+    if (magicStream && !magicStream->forReading && retval != -1)
+        PHYSFS_writeBytes((PHYSFS_File *)magicStream, buffer, retval);
+
+    return retval;
 } /* PHYSFS_readBytes */
 
 
@@ -2940,33 +2979,70 @@ PHYSFS_sint64 PHYSFS_writeBytes(PHYSFS_File *handle, const void *buffer,
 int PHYSFS_eof(PHYSFS_File *handle)
 {
     FileHandle *fh = (FileHandle *) handle;
+    int retval = 0;
 
-    if (!fh->forReading)  /* never EOF on files opened for write/append. */
-        return 0;
-
-    /* can't be eof if buffer isn't empty */
-    if (fh->bufpos == fh->buffill)
+    if (fh->io == NULL)
     {
-        /* check the Io. */
-        PHYSFS_Io *io = fh->io;
-        const PHYSFS_sint64 pos = io->tell(io);
-        const PHYSFS_sint64 len = io->length(io);
-        if ((pos < 0) || (len < 0))
-            return 0;  /* beats me. */
-        return (pos >= len);
+        if (magicStream && magicStream->forReading)
+        {
+            int retval;
+            PHYSFS_readBytes((PHYSFS_File *)magicStream, &retval, sizeof(int));
+            return retval;
+        } /* if */
+        return 0; /* magic stream opened file but no magic stream open */
     } /* if */
 
-    return 0;
+    if (!fh->forReading)  /* never EOF on files opened for write/append. */
+    {
+        retval = 0;
+    } /* if */
+    else
+    {
+        /* can't be eof if buffer isn't empty */
+        if (fh->bufpos == fh->buffill)
+        {
+            /* check the Io. */
+            PHYSFS_Io *io = fh->io;
+            const PHYSFS_sint64 pos = io->tell(io);
+            const PHYSFS_sint64 len = io->length(io);
+            if ((pos < 0) || (len < 0))
+                retval = 0;  /* beats me. */
+            retval = (pos >= len);
+        } /* if */
+    } /* else */
+
+    if (magicStream && !magicStream->forReading)
+        PHYSFS_writeBytes((PHYSFS_File *)magicStream, &retval, sizeof(int));
+
+    return retval;
 } /* PHYSFS_eof */
 
 
 PHYSFS_sint64 PHYSFS_tell(PHYSFS_File *handle)
 {
     FileHandle *fh = (FileHandle *) handle;
-    const PHYSFS_sint64 pos = fh->io->tell(fh->io);
-    const PHYSFS_sint64 retval = fh->forReading ?
-                                 (pos - fh->buffill) + fh->bufpos :
-                                 (pos + fh->buffill);
+    PHYSFS_sint64 pos;
+    PHYSFS_sint64 retval;
+
+    if (fh->io == NULL)
+    {
+        if (magicStream && magicStream->forReading)
+        {
+            PHYSFS_sint64 retval;
+            PHYSFS_readBytes((PHYSFS_File *)magicStream, &retval, sizeof(PHYSFS_sint64));
+            return retval;
+        } /* if */
+        return 0; /* magic stream opened file but no magic stream open */
+    } /* if */
+
+    pos = fh->io->tell(fh->io);
+    retval = fh->forReading ?
+             (pos - fh->buffill) + fh->bufpos :
+             (pos + fh->buffill);
+
+    if (magicStream && !magicStream->forReading)
+        PHYSFS_writeBytes((PHYSFS_File *)magicStream, &retval, sizeof(PHYSFS_sint64));
+
     return retval;
 } /* PHYSFS_tell */
 
@@ -2974,6 +3050,9 @@ PHYSFS_sint64 PHYSFS_tell(PHYSFS_File *handle)
 int PHYSFS_seek(PHYSFS_File *handle, PHYSFS_uint64 pos)
 {
     FileHandle *fh = (FileHandle *) handle;
+    if (fh->io == NULL) /* magic stream file; seeks are NOPs */
+        return 1;
+
     BAIL_IF_ERRPASS(!PHYSFS_flush(handle), 0);
 
     if (fh->buffer && fh->forReading)
@@ -2999,8 +3078,22 @@ int PHYSFS_seek(PHYSFS_File *handle, PHYSFS_uint64 pos)
 
 PHYSFS_sint64 PHYSFS_fileLength(PHYSFS_File *handle)
 {
+    PHYSFS_sint64 retval;
     PHYSFS_Io *io = ((FileHandle *) handle)->io;
-    return io->length(io);
+    if (io == NULL)
+    {
+        if (magicStream && magicStream->forReading)
+            PHYSFS_readBytes((PHYSFS_File *)magicStream, &retval, sizeof(PHYSFS_sint64));
+    } /* if */
+    else
+    {
+        retval = io->length(io);
+    } /* else */
+
+    if (magicStream && !magicStream->forReading)
+        PHYSFS_writeBytes((PHYSFS_File *)magicStream, &retval, sizeof(PHYSFS_sint64));
+
+    return retval;
 } /* PHYSFS_filelength */
 
 
@@ -3008,6 +3101,9 @@ int PHYSFS_setBuffer(PHYSFS_File *handle, PHYSFS_uint64 _bufsize)
 {
     FileHandle *fh = (FileHandle *) handle;
     const size_t bufsize = (size_t) _bufsize;
+
+    if (fh->io == NULL) /* magic stream dummy file handle */
+        return 1;
 
     if (!__PHYSFS_ui64FitsAddressSpace(_bufsize))
         BAIL(PHYSFS_ERR_INVALID_ARGUMENT, 0);
@@ -3056,6 +3152,9 @@ int PHYSFS_flush(PHYSFS_File *handle)
     FileHandle *fh = (FileHandle *) handle;
     PHYSFS_Io *io;
     PHYSFS_sint64 rc;
+
+    if (fh->io == NULL) /* magic stream dummy file handle */
+        return 1;
 
     if ((fh->forReading) || (fh->bufpos == fh->buffill))
         return 1;  /* open for read or buffer empty are successful no-ops. */
@@ -3127,9 +3226,38 @@ int PHYSFS_stat(const char *_fname, PHYSFS_Stat *stat)
 
     __PHYSFS_platformReleaseMutex(stateLock);
     __PHYSFS_smallFree(allocated_fname);
+
     return retval;
 } /* PHYSFS_stat */
 
+
+int PHYSFS_createMagicStream(PHYSFS_File *handle)
+{
+    FileHandle *fh = (FileHandle *)handle;
+    BAIL_IF(magicStream != NULL, PHYSFS_ERR_FILES_STILL_OPEN, 0);
+    BAIL_IF(!handle, PHYSFS_ERR_INVALID_ARGUMENT, 0);
+    BAIL_IF(fh->forReading, PHYSFS_ERR_INVALID_ARGUMENT, 0);
+    magicStream = fh;
+    return 1;
+}
+
+int PHYSFS_openMagicStream(PHYSFS_File *handle)
+{
+    FileHandle *fh = (FileHandle *)handle;
+    BAIL_IF(magicStream != NULL, PHYSFS_ERR_FILES_STILL_OPEN, 0);
+    BAIL_IF(!handle, PHYSFS_ERR_INVALID_ARGUMENT, 0);
+    BAIL_IF(!fh->forReading, PHYSFS_ERR_INVALID_ARGUMENT, 0);
+    magicStream = fh;
+    return 1;
+}
+
+int PHYSFS_closeMagicStream()
+{
+	BAIL_IF(magicStream == NULL, PHYSFS_ERR_IO, 0);
+    PHYSFS_close((PHYSFS_File *)magicStream);
+	magicStream = NULL;
+    return 1;
+}
 
 int __PHYSFS_readAll(PHYSFS_Io *io, void *buf, const size_t _len)
 {
